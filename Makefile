@@ -1,31 +1,21 @@
-CC = cc
-CFLAGS = -Wall -Wextra -O2 -std=c99
-LDFLAGS =
-
-UNAME := $(shell uname -s)
-
-VERSION := $(shell git describe --tags --always 2>/dev/null || echo dev)
-CFLAGS += -DVERSION=\"$(VERSION)\"
-
+CC ?= gcc
+CFLAGS ?= -O3 -Wall -Wextra -Wpedantic -std=c11
+LDFLAGS ?=
 TARGET = bloatfind
+SRC = bloatfind.c
 
-ifeq ($(UNAME),Darwin)
-    LDFLAGS += -framework IOKit
-endif
-
-ifeq ($(UNAME),FreeBSD)
-    CFLAGS += -D__FreeBSD__
-endif
-
-.PHONY: all clean install
+.PHONY: all clean debug sanitize
 
 all: $(TARGET)
 
-$(TARGET): bloatfind.c
+$(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+debug:
+	$(CC) -g -O0 -Wall -Wextra -o $(TARGET) $(SRC)
+
+sanitize:
+	$(CC) -fsanitize=address,undefined -g -O1 -o $(TARGET) $(SRC)
 
 clean:
 	rm -f $(TARGET)
-
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/

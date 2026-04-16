@@ -1,5 +1,5 @@
 # bloatfind
-###### Version 1.1.7
+###### Version 1.1.92
 
 A minimal cross-platform memory analyzer for Linux, macOS, and FreeBSD.
 
