@@ -1,0 +1,683 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <dirent.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <limits.h>
+#include <getopt.h>
+#include <stdarg.h>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#endif
+
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/proc_info.h>
+#include <sys/sysctl.h>
+#endif
+
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#endif
+
+#define RESET       "\033[0m"
+#define RED         "\033[31m"
+#define GREEN       "\033[32m"
+#define YELLOW      "\033[33m"
+#define BLUE        "\033[34m"
+#define MAGENTA     "\033[35m"
+#define CYAN        "\033[36m"
+#define BOLD        "\033[1m"
+#define DIM         "\033[2m"
+
+#define VERSION     "1.1.7"
+#define HIGH_MEM_THRESHOLD_MB 5120
+
+typedef struct {
+    pid_t pid;
+    char name[256];
+    unsigned long vm_rss;
+    unsigned long vm_size;
+} ProcessInfo;
+
+int verbose = 0;
+int test_mode = 0;
+int force_dump = 0;
+int sip_disabled = 0;  // macOS SIP status
+
+void log_verbose(int level, const char *fmt, ...) {
+    if (verbose < level) return;
+    va_list args;
+    va_start(args, fmt);
+    fprintf(stderr, "%s[verbose:%d]%s ", DIM, level, RESET);
+    vfprintf(stderr, fmt, args);
+    fprintf(stderr, "\n");
+    va_end(args);
+}
+
+#ifdef __APPLE__
+void check_sip_status(void) {
+    FILE *fp = popen("csrutil status 2>/dev/null", "r");
+    if (!fp) {
+        sip_disabled = 0;
+        return;
+    }
+    char buf[256];
+    sip_disabled = 0;
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        if (strstr(buf, "disabled")) {
+            sip_disabled = 1;
+            break;
+        }
+    }
+    pclose(fp);
+    log_verbose(2, "SIP status: %s", sip_disabled ? "disabled" : "enabled");
+}
+#else
+void check_sip_status(void) { sip_disabled = 0; }
+#endif
+
+int memory_dump_available(void) {
+#if defined(__linux__)
+    (void)check_sip_status; // Suppress unused warning
+    return 1;
+#elif defined(__APPLE__)
+    return sip_disabled;
+#else
+    return 0;
+#endif
+}
+
+static int compare_by_memory(const void *a, const void *b) {
+    const ProcessInfo *pa = (const ProcessInfo *)a;
+    const ProcessInfo *pb = (const ProcessInfo *)b;
+    if (pa->vm_rss > pb->vm_rss) return -1;
+    if (pa->vm_rss < pb->vm_rss) return 1;
+    return 0;
+}
+
+#ifdef __linux__
+int get_process_info_linux(ProcessInfo **procs, int *count) {
+    DIR *dir = opendir("/proc");
+    if (!dir) return -1;
+    int capacity = 100;
+    *count = 0;
+    *procs = malloc(capacity * sizeof(ProcessInfo));
+    log_verbose(2, "Linux: Scanning /proc for processes");
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!isdigit(entry->d_name[0])) continue;
+        pid_t pid = atoi(entry->d_name);
+        if (pid <= 0) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) {
+            log_verbose(3, "Cannot open %s", path);
+            continue;
+        }
+        unsigned long size, resident;
+        if (fscanf(f, "%lu %lu", &size, &resident) != 2) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+        FILE *fc = fopen(path, "r");
+        char name[256] = "unknown";
+        if (fc) {
+            if (fgets(name, sizeof(name), fc)) {
+                size_t len = strlen(name);
+                if (len > 0 && name[len-1] == '\n') name[len-1] = '\0';
+            }
+            fclose(fc);
+        }
+        if (*count >= capacity) {
+            capacity *= 2;
+            *procs = realloc(*procs, capacity * sizeof(ProcessInfo));
+        }
+        (*procs)[*count].pid = pid;
+        strncpy((*procs)[*count].name, name, 255);
+        (*procs)[*count].name[255] = '\0';
+        (*procs)[*count].vm_rss = resident * (sysconf(_SC_PAGESIZE) / 1024);
+        (*procs)[*count].vm_size = size * (sysconf(_SC_PAGESIZE) / 1024);
+        log_verbose(3, "Found process: %s (PID %d, RSS %lu KB)", (*procs)[*count].name, pid, (*procs)[*count].vm_rss);
+        (*count)++;
+    }
+    closedir(dir);
+    log_verbose(2, "Linux: Total processes found: %d", *count);
+    return 0;
+}
+#endif
+
+#ifdef __APPLE__
+int get_process_info_darwin(ProcessInfo **procs, int *count) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t bufSize = 0;
+    log_verbose(2, "Darwin: Getting process list size");
+    if (sysctl(mib, 4, NULL, &bufSize, NULL, 0) != 0) {
+        log_verbose(1, "sysctl failed: %s", strerror(errno));
+        return -1;
+    }
+    log_verbose(2, "Darwin: Allocating buffer of %zu bytes", bufSize);
+    struct kinfo_proc *kp = malloc(bufSize);
+    if (!kp) {
+        log_verbose(1, "malloc failed");
+        return -1;
+    }
+    if (sysctl(mib, 4, kp, &bufSize, NULL, 0) != 0) {
+        log_verbose(1, "sysctl (second call) failed: %s", strerror(errno));
+        free(kp);
+        return -1;
+    }
+    int nprocs = bufSize / sizeof(struct kinfo_proc);
+    log_verbose(2, "Darwin: Found %d process entries", nprocs);
+    int capacity = nprocs + 100;
+    *procs = malloc(capacity * sizeof(ProcessInfo));
+    if (!*procs) {
+        free(kp);
+        return -1;
+    }
+    *count = 0;
+    for (int i = 0; i < nprocs; i++) {
+        pid_t pid = kp[i].kp_proc.p_pid;
+        if (pid <= 0) continue;
+        struct proc_taskinfo pti;
+        int pti_size = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &pti, sizeof(pti));
+        unsigned long rss = 0;
+        unsigned long vsize = 0;
+        if (pti_size == sizeof(pti)) {
+            rss = pti.pti_resident_size / 1024;
+            vsize = pti.pti_virtual_size / 1024;
+        } else {
+            log_verbose(3, "proc_pidinfo failed for PID %d (ret=%d)", pid, pti_size);
+        }
+        char name[256] = {0};
+        int name_len = proc_name(pid, name, sizeof(name) - 1);
+        if (name_len <= 0) {
+            strncpy(name, kp[i].kp_proc.p_comm, 255);
+            name[255] = '\0';
+        }
+        if (strlen(name) == 0) {
+            snprintf(name, sizeof(name), "pid-%d", (int)pid);
+        }
+        if (*count >= capacity) {
+            capacity += 100;
+            ProcessInfo *tmp = realloc(*procs, capacity * sizeof(ProcessInfo));
+            if (!tmp) break;
+            *procs = tmp;
+        }
+        (*procs)[*count].pid = pid;
+        strncpy((*procs)[*count].name, name, 255);
+        (*procs)[*count].name[255] = '\0';
+        (*procs)[*count].vm_rss = rss;
+        (*procs)[*count].vm_size = vsize;
+        (*count)++;
+    }
+    free(kp);
+    log_verbose(2, "Darwin: Total processes with info: %d", *count);
+    return (*count > 0) ? 0 : -1;
+}
+#endif
+
+#if defined(__FreeBSD__)
+int get_process_info_bsd(ProcessInfo **procs, int *count) {
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+    size_t size;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) < 0) {
+        log_verbose(1, "sysctl failed: %s", strerror(errno));
+        return -1;
+    }
+    struct kinfo_proc *procs_kinfo = malloc(size);
+    if (!procs_kinfo) return -1;
+    if (sysctl(mib, 3, procs_kinfo, &size, NULL, 0) < 0) {
+        log_verbose(1, "sysctl (second call) failed: %s", strerror(errno));
+        free(procs_kinfo);
+        return -1;
+    }
+    int nprocs = size / sizeof(struct kinfo_proc);
+    *count = 0;
+    int capacity = nprocs;
+    *procs = malloc(capacity * sizeof(ProcessInfo));
+    for (int i = 0; i < nprocs; i++) {
+        pid_t pid = procs_kinfo[i].ki_pid;
+        if (pid <= 0) continue;
+        (*procs)[*count].pid = pid;
+        strncpy((*procs)[*count].name, procs_kinfo[i].ki_comm, 255);
+        (*procs)[*count].name[255] = '\0';
+        (*procs)[*count].vm_rss = procs_kinfo[i].ki_rssize * getpagesize() / 1024;
+        (*procs)[*count].vm_size = procs_kinfo[i].ki_size / 1024;
+        (*count)++;
+    }
+    free(procs_kinfo);
+    log_verbose(2, "FreeBSD: Total processes found: %d", *count);
+    return 0;
+}
+#endif
+
+int get_process_info(ProcessInfo **procs, int *count) {
+#if defined(__linux__)
+    return get_process_info_linux(procs, count);
+#elif defined(__APPLE__)
+    return get_process_info_darwin(procs, count);
+#elif defined(__FreeBSD__)
+    return get_process_info_bsd(procs, count);
+#else
+    return -1;
+#endif
+}
+
+const char* get_memory_color(double mem_gb) {
+    if (mem_gb >= 5.0) return RED;
+    if (mem_gb >= 1.0) return YELLOW;
+    if (mem_gb >= 0.5) return CYAN;
+    return GREEN;
+}
+
+void print_colored_memory(unsigned long mem_kb, int is_high) {
+    double mem_mb = mem_kb / 1024.0;
+    double mem_gb = mem_mb / 1024.0;
+    const char *color = get_memory_color(mem_gb);
+    if (is_high) printf("%s%s", BOLD, color);
+    else printf("%s", color);
+    if (mem_gb >= 1.0) printf("%.2f GB", mem_gb);
+    else printf("%.2f MB", mem_mb);
+    printf("%s", RESET);
+}
+
+void print_vsize(unsigned long vsize_kb) {
+    double vsize_gb = vsize_kb / 1024.0 / 1024.0;
+    if (vsize_gb >= 1000) {
+        double vsize_tb = vsize_gb / 1024.0;
+        printf("%.1f TB virt", vsize_tb);
+    } else if (vsize_gb >= 100) {
+        printf("%.0f GB virt", vsize_gb);
+    } else if (vsize_gb >= 1) {
+        printf("%.1f GB virt", vsize_gb);
+    } else {
+        double vsize_mb = vsize_kb / 1024.0;
+        printf("%.1f MB virt", vsize_mb);
+    }
+}
+
+int check_command(const char *cmd) {
+    char check[512];
+    snprintf(check, sizeof(check), "command -v %s >/dev/null 2>&1", cmd);
+    return system(check) == 0;
+}
+
+void write_memory_dump(pid_t pid, const char *name) {
+    char safe_name[256];
+    strncpy(safe_name, name, 255);
+    safe_name[255] = '\0';
+    for (int i = 0; safe_name[i]; i++) {
+        if (safe_name[i] == ' ' || safe_name[i] == '/' || safe_name[i] == '(' || safe_name[i] == ')')
+            safe_name[i] = '_';
+    }
+    
+    char filename[512];
+    snprintf(filename, sizeof(filename), "bloatfind_dump_%d_%s.core", (int)pid, safe_name);
+    
+    log_verbose(1, "Attempting memory dump for PID %d to %s", pid, filename);
+    
+    int success = 0;
+    
+#if defined(__linux__)
+    if (check_command("gcore")) {
+        log_verbose(2, "Using gcore for memory dump");
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "gcore -o %s %d 2>/dev/null", filename, (int)pid);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sMemory dump written to %s (via gcore)%s\n", GREEN, filename, RESET);
+            success = 1;
+        } else {
+            log_verbose(2, "gcore failed with exit code %d", ret);
+        }
+    }
+    
+    if (!success && check_command("gdb")) {
+        log_verbose(2, "Using gdb for memory dump");
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), 
+            "gdb -batch -p %d -ex 'gcore %s' -ex 'quit' 2>/dev/null",
+            (int)pid, filename);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sMemory dump written to %s (via gdb)%s\n", GREEN, filename, RESET);
+            success = 1;
+        }
+    }
+    
+    if (!success && force_dump) {
+        log_verbose(1, "Force dump enabled - attempting direct memory read");
+        printf("%sAttempting force dump via /proc/%d/mem...%s\n", YELLOW, (int)pid, RESET);
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), 
+            "(echo 'attach %d' && echo 'gcore %s' && echo 'detach' && echo 'quit') | gdb -q 2>/dev/null",
+            (int)pid, filename);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sForce dump written to %s%s\n", GREEN, filename, RESET);
+            success = 1;
+        }
+    }
+#elif defined(__APPLE__)
+    if (check_command("lldb")) {
+        log_verbose(2, "Using lldb for memory dump");
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+            "lldb -p %d -b -o 'process save-core %s' -o 'quit' 2>/dev/null",
+            (int)pid, filename);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sMemory dump written to %s (via lldb)%s\n", GREEN, filename, RESET);
+            success = 1;
+        } else {
+            log_verbose(2, "lldb failed with exit code %d", ret);
+        }
+    }
+    
+    if (!success && check_command("gcore")) {
+        log_verbose(2, "Using gcore for memory dump");
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "gcore -o %s %d 2>/dev/null", filename, (int)pid);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sMemory dump written to %s (via gcore)%s\n", GREEN, filename, RESET);
+            success = 1;
+        }
+    }
+    
+    if (!success && force_dump) {
+        log_verbose(1, "Force dump enabled on macOS");
+        printf("%sForce dump: Sending SIGSEGV to generate core dump...%s\n", YELLOW, RESET);
+        printf("%sWarning: This will crash the process!%s\n", RED, RESET);
+        printf("Checking core dump settings...\n");
+        system("ulimit -c unlimited 2>/dev/null; sysctl kern.corefile 2>/dev/null | grep -v 'unknown' || echo 'Core dumps may be disabled'");
+        printf("To actually force a core dump, run: kill -SEGV %d\n", (int)pid);
+        printf("Core dump will be saved according to kern.corefile setting.\n");
+    }
+#else
+    if (check_command("gcore")) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "gcore -o %s %d 2>/dev/null", filename, (int)pid);
+        int ret = system(cmd);
+        if (ret == 0) {
+            printf("%sMemory dump written to %s%s\n", GREEN, filename, RESET);
+            success = 1;
+        }
+    }
+#endif
+    
+    if (!success) {
+        printf("%sFailed to write memory dump.%s\n", RED, RESET);
+#if defined(__linux__)
+        printf("Available options:\n");
+        printf("  - Install gdb: sudo apt-get install gdb\n");
+        printf("  - Enable core dumps: ulimit -c unlimited\n");
+        printf("  - Use --force-dump to try harder (may affect process stability)\n");
+#elif defined(__APPLE__)
+        if (sip_disabled) {
+            printf("SIP is disabled, but memory dump still failed.\n");
+            printf("You may need to enable core dumps: sudo sysctl kern.coredump=1\n");
+        } else {
+            printf("Memory dump not available on macOS due to SIP (System Integrity Protection).\n");
+            printf("Disable SIP in Recovery Mode if you really need this feature.\n");
+        }
+#else
+        printf("Install gdb or equivalent debugger for memory dumps.\n");
+#endif
+    }
+}
+
+int is_process_exempt(const char *name, char **exempt_list, int exempt_count) {
+    for (int i = 0; i < exempt_count; i++) {
+        if (strcmp(exempt_list[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
+void print_usage(const char *prog) {
+    int dump_avail = memory_dump_available();
+    
+    printf("Usage: %s [OPTIONS]\n\n", prog);
+    printf("Options:\n");
+    printf("  -v, --verbose       Increase verbosity (-v, -vv, -vvv)\n");
+    printf("      --verbose N     Set verbosity level 0-3\n");
+    printf("  -t, --test          Test mode: show interactive prompt for first process\n");
+    printf("  -f, --force-dump    Force memory dump (aggressive mode, may crash process)\n");
+    printf("  -V, --version       Show version and exit\n");
+    printf("  -h, --help          Show this help message\n");
+    printf("\n");
+    printf("Interactive commands:\n");
+    printf("  yes/y     Kill the process\n");
+    printf("  pause/p   Pause the process\n");
+    printf("  exempt/e  Skip and add to exempt list\n");
+    if (dump_avail) {
+        printf("  write/w   Write memory dump (requires gdb/gcore)\n");
+    }
+    printf("  no/n      Skip this process\n");
+    
+#if defined(__APPLE__)
+    printf("\n");
+    if (dump_avail) {
+        printf("Note: Memory dump is available because SIP is disabled.\n");
+    } else {
+        printf("Note: Memory dump is disabled because SIP (System Integrity Protection) is enabled.\n");
+    }
+#endif
+}
+
+void print_version(void) {
+    printf("bloatfind version %s\n", VERSION);
+    printf("Universal *nix memory analyzer\n");
+    
+#if defined(__linux__)
+    printf("Platform: Linux\n");
+#elif defined(__APPLE__)
+    check_sip_status();
+    if (sip_disabled) {
+        printf("Platform: macOS (SIP disabled - memory dump available)\n");
+    } else {
+        printf("Platform: macOS (SIP enabled - memory dump restricted)\n");
+    }
+#elif defined(__FreeBSD__)
+    printf("Platform: FreeBSD\n");
+#else
+    printf("Platform: Unknown\n");
+#endif
+}
+
+void handle_process_interaction(ProcessInfo *proc, char **exempt_list, int *exempt_count, int *exempt_capacity) {
+    int dump_avail = memory_dump_available();
+    double mem_gb = proc->vm_rss / 1024.0 / 1024.0;
+    
+    printf("%s=== ALERT ===%s\n", BOLD RED, RESET);
+    printf("Okay, we found %s%s%s. Takes up %s%.2f GB%s of RAM and could be the main reason for the system to lag.\n",
+           BOLD, proc->name, RESET, BOLD, mem_gb, RESET);
+    
+    if (dump_avail) {
+        printf("Kill? (Yes/No/Pause/Exempt/Write memory dump): ");
+    } else {
+        printf("Kill? (Yes/No/Pause/Exempt): ");
+    }
+    fflush(stdout);
+    
+    char response[256];
+    if (fgets(response, sizeof(response), stdin) == NULL) return;
+    size_t len = strlen(response);
+    if (len > 0 && response[len-1] == '\n') response[len-1] = '\0';
+    log_verbose(1, "User response: '%s'", response);
+    
+    if (strcasecmp(response, "yes") == 0 || strcasecmp(response, "y") == 0) {
+        if (kill(proc->pid, SIGKILL) == 0)
+            printf("%sProcess %d (%s) killed.%s\n", GREEN, (int)proc->pid, proc->name, RESET);
+        else
+            printf("%sFailed to kill process %d: %s%s\n", RED, (int)proc->pid, strerror(errno), RESET);
+    } else if (strcasecmp(response, "pause") == 0 || strcasecmp(response, "p") == 0) {
+        if (kill(proc->pid, SIGSTOP) == 0) {
+            printf("%sProcess %d (%s) paused (SIGSTOP).%s\n", YELLOW, (int)proc->pid, proc->name, RESET);
+            printf("Resume with: kill -CONT %d\n", (int)proc->pid);
+        } else {
+            printf("%sFailed to pause process %d: %s%s\n", RED, (int)proc->pid, strerror(errno), RESET);
+        }
+    } else if (strcasecmp(response, "exempt") == 0 || strcasecmp(response, "e") == 0) {
+        if (*exempt_count >= *exempt_capacity) {
+            *exempt_capacity *= 2;
+            exempt_list = realloc(exempt_list, (*exempt_capacity) * sizeof(char *));
+        }
+        exempt_list[*exempt_count] = strdup(proc->name);
+        (*exempt_count)++;
+        printf("%s%s added to exempt list.%s\n", YELLOW, proc->name, RESET);
+    } else if (dump_avail && 
+               (strncasecmp(response, "write", 5) == 0 || response[0] == 'w' ||
+                strncasecmp(response, "dump", 4) == 0)) {
+        write_memory_dump(proc->pid, proc->name);
+    } else {
+        printf("%sSkipping process %d (%s).%s\n", BLUE, (int)proc->pid, proc->name, RESET);
+    }
+    printf("\n");
+}
+
+int main(int argc, char *argv[]) {
+    int opt;
+    int option_index = 0;
+    static struct option long_options[] = {
+        {"verbose", optional_argument, 0, 0},
+        {"test", no_argument, 0, 't'},
+        {"force-dump", no_argument, 0, 'f'},
+        {"version", no_argument, 0, 'V'},
+        {"help", no_argument, 0, 'h'},
+        {0, 0, 0, 0}
+    };
+    while ((opt = getopt_long(argc, argv, "vVthf", long_options, &option_index)) != -1) {
+        switch (opt) {
+            case 0:
+                if (strcmp(long_options[option_index].name, "verbose") == 0) {
+                    if (optarg) {
+                        verbose = atoi(optarg);
+                        if (verbose < 0) verbose = 0;
+                        if (verbose > 3) verbose = 3;
+                    } else {
+                        verbose = 1;
+                    }
+                }
+                break;
+            case 'v':
+                verbose++;
+                if (verbose > 3) verbose = 3;
+                break;
+            case 't':
+                test_mode = 1;
+                break;
+            case 'f':
+                force_dump = 1;
+                break;
+            case 'V':
+                print_version();
+                return 0;
+            case 'h':
+                print_usage(argv[0]);
+                return 0;
+            default:
+                print_usage(argv[0]);
+                return 1;
+        }
+    }
+    for (int i = optind; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0) verbose++;
+    }
+    if (verbose > 3) verbose = 3;
+    
+    // Check SIP status early on macOS
+#ifdef __APPLE__
+    check_sip_status();
+#endif
+    
+    log_verbose(1, "Verbose level: %d", verbose);
+    log_verbose(1, "Test mode: %s", test_mode ? "enabled" : "disabled");
+    log_verbose(1, "Force dump: %s", force_dump ? "enabled" : "disabled");
+#if defined(__APPLE__)
+    log_verbose(1, "SIP status: %s", sip_disabled ? "disabled" : "enabled");
+#endif
+    
+    ProcessInfo *procs = NULL;
+    int count = 0;
+    char **exempt_list = malloc(100 * sizeof(char *));
+    int exempt_count = 0;
+    int exempt_capacity = 100;
+    
+    printf("%s=== BloatFind - Memory Usage Analyzer ===%s\n\n", CYAN, RESET);
+    
+    if (get_process_info(&procs, &count) < 0) {
+        fprintf(stderr, "Failed to get process information\n");
+        return 1;
+    }
+    log_verbose(1, "Retrieved %d processes", count);
+    qsort(procs, count, sizeof(ProcessInfo), compare_by_memory);
+    
+    printf("%-8s %-35s %12s  %s\n", "PID", "NAME", "MEMORY", "VIRT_SIZE");
+    printf("%-8s %-35s %12s  %s\n", "--------", "-----------------------------------", "------------", "---------");
+    
+    int display_count = count < 20 ? count : 20;
+    for (int i = 0; i < display_count; i++) {
+        int is_high = procs[i].vm_rss > HIGH_MEM_THRESHOLD_MB * 1024;
+        printf("%-8d ", (int)procs[i].pid);
+        char display_name[36];
+        if (strlen(procs[i].name) > 35) {
+            snprintf(display_name, sizeof(display_name), "%.32s...", procs[i].name);
+        } else {
+            strncpy(display_name, procs[i].name, 35);
+            display_name[35] = '\0';
+        }
+        if (is_high) printf("%s%s%s", BOLD, RED, display_name);
+        else printf("%s", display_name);
+        int name_len = strlen(display_name);
+        for (int j = name_len; j < 35; j++) printf(" ");
+        printf("%s", RESET);
+        printf(" ");
+        print_colored_memory(procs[i].vm_rss, is_high);
+        printf("  ");
+        printf("%s", DIM);
+        print_vsize(procs[i].vm_size);
+        printf("  (real)%s", RESET);
+        printf("\n");
+    }
+    
+    printf("\n%sLegend:%s\n", BLUE, RESET);
+    printf("  Memory: %sLow%s/%sMed%s/%sHigh%s/%sCritical%s | %sBold = >5GB%s\n",
+           GREEN, RESET, CYAN, RESET, YELLOW, RESET, RED, RESET, BOLD, RESET);
+    printf("  %sVIRT_SIZE shows virtual address space (includes memory-mapped files)%s\n", DIM, RESET);
+    printf("  %sOn macOS this can be huge (1000+ GB) and is usually not a concern%s\n\n", DIM, RESET);
+    
+    int found_high = 0;
+    for (int i = 0; i < count; i++) {
+        if (procs[i].vm_rss > HIGH_MEM_THRESHOLD_MB * 1024) {
+            if (is_process_exempt(procs[i].name, exempt_list, exempt_count)) {
+                log_verbose(2, "Skipping exempt process: %s", procs[i].name);
+                continue;
+            }
+            found_high = 1;
+            handle_process_interaction(&procs[i], exempt_list, &exempt_count, &exempt_capacity);
+        }
+    }
+    
+    if (test_mode && !found_high && count > 0) {
+        log_verbose(1, "Test mode: prompting for top process");
+        printf("%s[Test Mode] No high memory process found, prompting for top process...%s\n\n", YELLOW, RESET);
+        handle_process_interaction(&procs[0], exempt_list, &exempt_count, &exempt_capacity);
+    }
+    
+    for (int i = 0; i < exempt_count; i++) free(exempt_list[i]);
+    free(exempt_list);
+    free(procs);
+    return 0;
+}
