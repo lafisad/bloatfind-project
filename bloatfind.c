@@ -1,6 +1,8 @@
+#define _GNU_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <signal.h>
 #include <dirent.h>
@@ -667,14 +669,14 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             found_high = 1;
-            handle_process_interaction(handle_process_interaction(&procs[i], exempt_listprocs[i], &exempt_list, &exempt_count, &exempt_capacity);
+            handle_process_interaction(&procs[i], &exempt_list, &exempt_count, &exempt_capacity);
         }
     }
     
     if (test_mode && !found_high && count > 0) {
         log_verbose(1, "Test mode: prompting for top process");
         printf("%s[Test Mode] No high memory process found, prompting for top process...%s\n\n", YELLOW, RESET);
-        handle_process_interaction(handle_process_interaction(&procs[0], exempt_listprocs[0], &exempt_list, &exempt_count, &exempt_capacity);
+        handle_process_interaction(&procs[0], &exempt_list, &exempt_count, &exempt_capacity);
     }
     
     for (int i = 0; i < exempt_count; i++) free(exempt_list[i]);

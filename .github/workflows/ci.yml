@@ -2,18 +2,58 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: [main, master]
+    tags: ['v*']
   pull_request:
+    branches: [main, master]
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: make
+      - name: Build with ${{ matrix.cc }}
+        run: |
+          make clean
+          CC=${{ matrix.cc }} make
 
-      - name: Verify binary
-        run: test -x ./bloatfind
+      - name: Build debug version
+        run: |
+          make clean
+          CC=${{ matrix.cc }} make debug
+
+      - name: Build with sanitizers
+        run: |
+          make clean
+          CC=${{ matrix.cc }} make sanitize
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloatfind-${{ matrix.os }}-${{ matrix.cc }}
+          path: bloatfind
+          retention-days: 7
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: sudo apt-get update && sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: cppcheck --error-exitcode=1 --enable=all --suppress=missingIncludeSystem bloatfind.c
+
+      - name: Check formatting with clang-format
+        run: |
+          if command -v clang-format &> /dev/null; then
+            clang-format --dry-run --Werror bloatfind.c
+          else
+            echo "clang-format not available, skipping"
+          fi

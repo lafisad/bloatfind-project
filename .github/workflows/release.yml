@@ -1,50 +1,66 @@
-name: Build & Release
+name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ['v*']
+
+permissions:
+  contents: write
 
 jobs:
-  build:
+  build-release:
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            name: linux-x86_64
+            cc: gcc
+            suffix: linux-x86_64
           - os: macos-latest
-            name: macos-arm64
-
+            cc: clang
+            suffix: macos-universal
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build
-        run: make
+      - name: Build release binary
+        run: |
+          CC=${{ matrix.cc }} CFLAGS="-O3 -Wall -Wextra -Wpedantic -std=c11 -static" make
 
-      - name: Rename binary
-        run: mv bloatfind bloatfind-${{ matrix.name }}
+      - name: Strip binary
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            strip bloatfind
+          fi
 
-      - name: Create archive
-        run: tar -czf bloatfind-${{ matrix.name }}.tar.gz bloatfind-${{ matrix.name }}
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp bloatfind dist/bloatfind-${{ matrix.suffix }}
+          chmod +x dist/bloatfind-${{ matrix.suffix }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: bloatfind-${{ matrix.name }}.tar.gz
+          name: bloatfind-${{ matrix.suffix }}
+          path: dist/
 
-  release:
-    needs: build
+  create-release:
+    needs: build-release
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
 
-      - name: Create GitHub Release
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
           generate_release_notes: true
-          files: |
-            **/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
