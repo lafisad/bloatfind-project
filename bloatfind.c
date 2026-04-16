@@ -37,7 +37,9 @@
 #define BOLD        "\033[1m"
 #define DIM         "\033[2m"
 
-#define VERSION     "1.1.7"
+#ifndef VERSION
+#define VERSION "dev"
+#endif
 #define HIGH_MEM_THRESHOLD_MB 5120
 
 typedef struct {
@@ -496,7 +498,7 @@ void print_version(void) {
 #endif
 }
 
-void handle_process_interaction(ProcessInfo *proc, char **exempt_list, int *exempt_count, int *exempt_capacity) {
+void handle_process_interaction(ProcessInfo *proc, char ***exempt_list, int *exempt_count, int *exempt_capacity) {
     int dump_avail = memory_dump_available();
     double mem_gb = proc->vm_rss / 1024.0 / 1024.0;
     
@@ -532,9 +534,8 @@ void handle_process_interaction(ProcessInfo *proc, char **exempt_list, int *exem
     } else if (strcasecmp(response, "exempt") == 0 || strcasecmp(response, "e") == 0) {
         if (*exempt_count >= *exempt_capacity) {
             *exempt_capacity *= 2;
-            exempt_list = realloc(exempt_list, (*exempt_capacity) * sizeof(char *));
-        }
-        exempt_list[*exempt_count] = strdup(proc->name);
+            *exempt_list = realloc(*exempt_list, (*exempt_capacity) * sizeof(char *));        }
+        (*exempt_list)[*exempt_count] = strdup(proc->name);
         (*exempt_count)++;
         printf("%s%s added to exempt list.%s\n", YELLOW, proc->name, RESET);
     } else if (dump_avail && 
@@ -666,14 +667,14 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             found_high = 1;
-            handle_process_interaction(&procs[i], exempt_list, &exempt_count, &exempt_capacity);
+            handle_process_interaction(handle_process_interaction(&procs[i], exempt_listprocs[i], &exempt_list, &exempt_count, &exempt_capacity);
         }
     }
     
     if (test_mode && !found_high && count > 0) {
         log_verbose(1, "Test mode: prompting for top process");
         printf("%s[Test Mode] No high memory process found, prompting for top process...%s\n\n", YELLOW, RESET);
-        handle_process_interaction(&procs[0], exempt_list, &exempt_count, &exempt_capacity);
+        handle_process_interaction(handle_process_interaction(&procs[0], exempt_listprocs[0], &exempt_list, &exempt_count, &exempt_capacity);
     }
     
     for (int i = 0; i < exempt_count; i++) free(exempt_list[i]);

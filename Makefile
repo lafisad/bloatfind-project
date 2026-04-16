@@ -2,32 +2,30 @@ CC = cc
 CFLAGS = -Wall -Wextra -O2 -std=c99
 LDFLAGS =
 
-# Platform detection for platform-specific libs
 UNAME := $(shell uname -s)
 
-ifeq ($(UNAME),Linux)
-    TARGET = bloatfind
-endif
+VERSION := $(shell git describe --tags --always 2>/dev/null || echo dev)
+CFLAGS += -DVERSION=\"$(VERSION)\"
+
+TARGET = bloatfind
 
 ifeq ($(UNAME),Darwin)
-    TARGET = bloatfind
     LDFLAGS += -framework IOKit
 endif
 
 ifeq ($(UNAME),FreeBSD)
-    TARGET = bloatfind
     CFLAGS += -D__FreeBSD__
 endif
 
 .PHONY: all clean install
 
-all: bloatfind
+all: $(TARGET)
 
-bloatfind: bloatfind.c
+$(TARGET): bloatfind.c
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f bloatfind
+	rm -f $(TARGET)
 
-install: bloatfind
-	install -m 755 bloatfind /usr/local/bin/
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/bin/
